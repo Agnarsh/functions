@@ -123,6 +123,8 @@ class BaseFunction(object):
 
     def __init__(self):
 
+        self.logger = logging.getLogger(f"{self.__module__}.{self.__class__.__name__}")
+
         if self.name is None:
             self.name = self.__class__.__name__
 

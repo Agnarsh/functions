@@ -406,10 +406,12 @@ class ProduceAlerts(object):
 
                             if alert_name in self.alerts_to_database:
                                 kpi_input = self.alert_to_kpi_input_dict.get(alert_name)
-                                db_insert_parameter = (df_row[0][0], df_row[0][1], self.entity_type_id, alert_name,
-                                                       kpi_input.get('Severity', None), kpi_input.get('Priority', None),
-                                                       kpi_input.get('Status', None))
-                                key_and_msg_and_db_parameter.append((key, value, db_insert_parameter))
+                                # kohlmann
+                                if not isinstance(df_row[0], pd.Timestamp):
+                                    db_insert_parameter = (df_row[0][0], df_row[0][1], self.entity_type_id, alert_name,
+                                                           kpi_input.get('Severity', None), kpi_input.get('Priority', None),
+                                                           kpi_input.get('Status', None))
+                                    key_and_msg_and_db_parameter.append((key, value, db_insert_parameter))
                             else:
                                 key_and_msg.append((key, value))
 
