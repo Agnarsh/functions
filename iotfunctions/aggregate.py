@@ -6,11 +6,11 @@
 import re
 import logging
 from collections import defaultdict
-from functools import partial
 
 import pandas as pd
 import numpy as np
 
+import iotfunctions.metadata as md
 from iotfunctions.base import (BaseAggregator, BaseFunction)
 from iotfunctions.util import log_data_frame
 
@@ -100,8 +100,8 @@ class Aggregation(BaseFunction):
                 if src in numerics:
                     agg_dict[src].append(agg)
                 else:
-                    numeric_only_funcs = set(['sum', 'mean', 'std', 'var', 'prod', Sum, Mean,
-                                              StandardDeviation, Variance, Product])
+                    numeric_only_funcs = {'sum', 'mean', 'std', 'var', 'prod', Sum, Mean, StandardDeviation, Variance,
+                                          Product}
                     if agg not in numeric_only_funcs:
                         agg_dict[src].append(agg)
 
@@ -114,9 +114,16 @@ class Aggregation(BaseFunction):
 
         df = df.reset_index()
 
+        # The index has been moved to the columns and the index levels ('id', event timestamp, dimensions) can now be
+        # used as a starting point of an aggregation. Provide index level 'id' - if it exists - as 'entity_id' as well.
+        if 'id' in df.columns:
+            df['entity_id'] = df['id']
+
         group_base = []
+        group_base_names = []
         if len(self.ids) > 0 and self.entityFirst:
             group_base.extend(self.ids)
+            group_base_names.extend(self.ids)
 
         if self.timestamp is not None and self.frequency is not None:
             if self.frequency == 'W':
@@ -125,11 +132,14 @@ class Aggregation(BaseFunction):
             else:
                 # other alias seems to not needing to special handle
                 group_base.append(pd.Grouper(key=self.timestamp, freq=self.frequency))
+            group_base_names.append(self.timestamp)
 
         if self.groupby is not None and len(self.groupby) > 0:
             group_base.extend(self.groupby)
+            group_base_names.extend(self.groupby)
 
-        self.logger.debug('aggregation_groupbase=%s' % str(group_base))
+        self.logger.debug(f'group_base={str(group_base)}, '
+                          f'group_base_names={str(group_base_names)}')
 
         groups = df.groupby(group_base)
 
@@ -158,7 +168,7 @@ class Aggregation(BaseFunction):
 
         new_columns = []
         for col in df_agg.columns:
-            if len(col[-1]) == 0 or col[0] in ([self.timestamp] + list(self.groupby)):
+            if len(col[-1]) == 0:
                 new_columns.append('|'.join(col[:-1]))
             else:
                 new_columns.append('|'.join(col))
@@ -179,22 +189,39 @@ class Aggregation(BaseFunction):
             self.logger.info('executing complex aggregation function - output %s' % str(names))
             df_apply = groups.apply(func)
 
+            # Some aggregation functions return None instead of an empty data frame. Therefore the result of
+            # groups.apply() can be an empty data frame without columns and without index when all function calls
+            # returned None. We take corrective action and build a new empty dataframe with the expected columns and
+            # the expected index including level names
             if df_apply.empty and df_apply.columns.empty:
+
+                # Build empty index with correct level names
+                if len(group_base_names) > 1:
+                    tmp_array = [[] for i in range(len(group_base_names))]
+                    new_index = pd.MultiIndex.from_arrays(tmp_array, names=group_base_names)
+                else:
+                    new_index = pd.Index([], name=group_base_names[0])
+
+                # Build data frame with index and expected columns
+                df_apply = pd.DataFrame([], columns=names, index=new_index)
+
+                # Cast columns in data frame to the expected type
+                column_types = {}
                 for name in names:
-                    df_apply[name] = None
-
                     source_metadata = self.dms.data_items.get(name)
-                    if source_metadata is None:
-                        continue
 
-                    if source_metadata.get(DATA_ITEM_COLUMN_TYPE_KEY) == DATA_ITEM_DATATYPE_NUMBER:
-                        df_apply = df_apply.astype({name: float})
-                    elif source_metadata.get(DATA_ITEM_COLUMN_TYPE_KEY) == DATA_ITEM_DATATYPE_BOOLEAN:
-                        df_apply = df_apply.astype({name: bool})
-                    elif source_metadata.get(DATA_ITEM_COLUMN_TYPE_KEY) == DATA_ITEM_DATATYPE_TIMESTAMP:
-                        df_apply = df_apply.astype({name: 'datetime64[ns]'})
+                    if source_metadata.get(md.DATA_ITEM_COLUMN_TYPE_KEY) == md.DATA_ITEM_TYPE_NUMBER:
+                        tmp_type = float
+                    elif source_metadata.get(md.DATA_ITEM_COLUMN_TYPE_KEY) == md.DATA_ITEM_TYPE_BOOLEAN:
+                        tmp_type = bool
+                    elif source_metadata.get(md.DATA_ITEM_COLUMN_TYPE_KEY) == md.DATA_ITEM_TYPE_TIMESTAMP:
+                        tmp_type = 'datetime64[ns]'
                     else:
-                        df_apply = df_apply.astype({name: str})
+                        tmp_type = str
+
+                    column_types[name] = tmp_type
+
+                df_apply = df_apply.astype(dtype=column_types, copy=False)
 
             all_dfs.append(df_apply)
 
@@ -216,11 +243,11 @@ class Aggregation(BaseFunction):
                     if source_metadata is None:
                         continue
 
-                    if source_metadata.get(DATA_ITEM_COLUMN_TYPE_KEY) == DATA_ITEM_DATATYPE_NUMBER:
+                    if source_metadata.get(md.DATA_ITEM_COLUMN_TYPE_KEY) == md.DATA_ITEM_TYPE_NUMBER:
                         df_direct = df_direct.astype({name: float})
-                    elif source_metadata.get(DATA_ITEM_COLUMN_TYPE_KEY) == DATA_ITEM_DATATYPE_BOOLEAN:
+                    elif source_metadata.get(md.DATA_ITEM_COLUMN_TYPE_KEY) == md.DATA_ITEM_TYPE_BOOLEAN:
                         df_direct = df_direct.astype({name: bool})
-                    elif source_metadata.get(DATA_ITEM_COLUMN_TYPE_KEY) == DATA_ITEM_DATATYPE_TIMESTAMP:
+                    elif source_metadata.get(md.DATA_ITEM_COLUMN_TYPE_KEY) == md.DATA_ITEM_TYPE_TIMESTAMP:
                         df_direct = df_direct.astype({name: 'datetime64[ns]'})
                     else:
                         df_direct = df_direct.astype({name: str})
@@ -231,6 +258,11 @@ class Aggregation(BaseFunction):
 
         # concat all results
         df = pd.concat(all_dfs, axis=1)
+
+        # Corrective action: pd.concat() removes name from Index when we only have one level. There is no issue for
+        # MultiIndex which is used for two and more levels
+        if len(group_base_names) == 1:
+            df.index.names = group_base_names
 
         # Adding entity_id column in the aggregate df by default
         id_idx = 'id'
@@ -571,4 +603,4 @@ class AggregateWithCalculation(SimpleAggregator):
         self.expression = expression
 
     def execute(self, group):
-        return eval(re.sub(r"\$\{GROUP\}", r"group", self.expression))
+        return eval(re.sub(r"\${GROUP}", r"group", self.expression))

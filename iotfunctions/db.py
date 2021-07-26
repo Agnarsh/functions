@@ -69,6 +69,11 @@ class Database(object):
     system_package_url = 'git+https://github.com/ibm-watson-iot/functions.git'
     bif_sql = "V1000-18.sql"
 
+    CERTIFICATE_FILE = 'certificate_file'
+
+    OS_API_CERTIFICATE_FILE = 'API_CERTIFICATE_FILE'
+    OS_DB_CERTIFICATE_FILE = 'DB_CERTIFICATE_FILE'
+
     def __init__(self, credentials=None, start_session=False, echo=False, tenant_id=None, entity_metadata=None,
                  entity_type=None, entity_type_id=None, model_store=None):
 
@@ -175,6 +180,7 @@ class Database(object):
             msg = 'Missing objectStorage credentials. Database object created, but it will not be able interact with object storage'
             logger.warning(msg)
 
+        as_api_certificate_file = None
         as_creds = credentials.get('iotp', None)
         if as_creds is None:
             as_api_host = credentials.get('as_api_host', None)
@@ -184,6 +190,7 @@ class Database(object):
             as_api_host = as_creds.get('asHost', None)
             as_api_key = as_creds.get('apiKey', None)
             as_api_token = as_creds.get('apiToken', None)
+            as_api_certificate_file = as_creds.get(Database.CERTIFICATE_FILE, None)
 
         try:
             if as_api_host is None:
@@ -192,17 +199,22 @@ class Database(object):
                 as_api_key = os.environ.get('API_KEY')
             if as_api_token is None:
                 as_api_token = os.environ.get('API_TOKEN')
+            if as_api_certificate_file is None:
+                as_api_certificate_file = os.environ.get(Database.OS_API_CERTIFICATE_FILE)
+
         except KeyError:
             as_api_host = None
             as_api_key = None
             as_api_token = None
+            as_api_certificate_file = None
             msg = 'Unable to locate AS credentials or environment variable. db will not be able to connect to the AS API'
             logger.warning(msg)
 
         if as_api_host is not None and as_api_host.startswith('https://'):
             as_api_host = as_api_host[8:]
 
-        self.credentials['as'] = {'host': as_api_host, 'api_key': as_api_key, 'api_token': as_api_token}
+        self.credentials['as'] = {'host': as_api_host, 'api_key': as_api_key, 'api_token': as_api_token,
+                                  Database.CERTIFICATE_FILE: as_api_certificate_file}
 
         try:
             icp_variable = os.environ.get("isICP")
@@ -237,7 +249,7 @@ class Database(object):
         # is sqlite for testing purposes
         connection_string_from_env = os.environ.get('DB_CONNECTION_STRING')
         db_type_from_env = os.environ.get('DB_TYPE')
-        db_certificate_file_from_env = os.environ.get('DB_CERTIFICATE_FILE')
+        db_certificate_file_from_env = os.environ.get(Database.OS_DB_CERTIFICATE_FILE)
 
         sqlalchemy_connection_kwargs = {}
         sqlite_warning_msg = 'Note sqlite can only be used for local testing. It is not a supported AS database.'
@@ -268,20 +280,24 @@ class Database(object):
                     self.credentials['db2']['password'],)
 
                 security_extension = ''
-                if 'security' in self.credentials['db2'] or self.credentials['db2']['port'] == 50001:
+                if ('security' in self.credentials['db2'] and self.credentials['db2']['security'] is True) or \
+                        self.credentials['db2']['port'] == 50001:
                     security_extension += 'SECURITY=ssl;'
-                    if os.path.exists('/secrets/truststore/db2_certificate.pem'):
-                        security_extension += ';SSLServerCertificate=' + '/secrets/truststore/db2_certificate.pem' + ";"
+                    if Database.CERTIFICATE_FILE in self.credentials['db2']:
+                        security_extension += f"SSLServerCertificate=" \
+                                              f"{self.credentials['db2'][Database.CERTIFICATE_FILE]};"
+                    elif os.path.exists('/secrets/truststore/db2_certificate.pem'):
+                        security_extension += 'SSLServerCertificate=' + '/secrets/truststore/db2_certificate.pem' + ";"
                     else:
                         cwd1 = os.getcwd()
                         filename1 = cwd1 + "/db2_certificate.pem"
                         logger.debug('file name db => %s' % filename1)
                         if os.path.exists(filename1):
-                            security_extension += ';SSLServerCertificate=' + filename1 + ";"
+                            security_extension += 'SSLServerCertificate=' + filename1 + ";"
                         else:
                             if db_certificate_file_from_env is not None:
                                 if os.path.exists(db_certificate_file_from_env):
-                                    security_extension += ';SSLServerCertificate=' + db_certificate_file_from_env + ";"
+                                    security_extension += 'SSLServerCertificate=' + db_certificate_file_from_env + ";"
 
                 sqlalchemy_connection_string += security_extension
                 native_connection_string += security_extension
@@ -317,9 +333,9 @@ class Database(object):
                     if connection_string_from_env.endswith(';'):
                         connection_string_from_env = connection_string_from_env[:-1]
                     try:
-                        ev = dict(item.split("=") for item in connection_string_from_env.split(";"))
+                        ev = dict(item.split("=", maxsplit=1) for item in connection_string_from_env.split(";"))
                         sqlalchemy_connection_string = 'db2+ibm_db://%s:%s@%s:%s/%s;' % (
-                            ev['UID'], ev['PWD'], ev['HOSTNAME'], ev['PORT'], ev['DATABASE'])
+                            ev['UID'], ev['PWD'].rstrip("\n"), ev['HOSTNAME'], ev['PORT'], ev['DATABASE'])
 
                         native_connection_string = connection_string_from_env + ';'
 
@@ -337,8 +353,8 @@ class Database(object):
                                     sqlalchemy_connection_string += tmp_string
                                     native_connection_string += tmp_string
                                 elif db_certificate_file_from_env is not None:
-                                    logger.debug(
-                                        'Found certificate filename in os variable DB_CERTIFICATE_FILE: %s' % db_certificate_file_from_env)
+                                    logger.debug(f'Found certificate filename in os variable '
+                                                 f'{Database.OS_DB_CERTIFICATE_FILE}: {db_certificate_file_from_env}')
                                     if os.path.exists(db_certificate_file_from_env):
                                         tmp_string = 'SSLServerCertificate=' + db_certificate_file_from_env + ";"
                                         sqlalchemy_connection_string += tmp_string
@@ -384,28 +400,24 @@ class Database(object):
             logger.warning(sqlite_warning_msg)
 
         is_icp = os.environ.get("isICP")
-        logger.debug("PATH -1 inside icp for poolmanager for APM ")
         if is_icp is not None and is_icp == 'true':
-            logger.debug("PATH 0 : inside icp for poolmanager for APM ")
             if os.path.exists('/secrets/truststore/ca_public_cert.pem'):
-                logger.debug("PATH 1 : inside icp for poolmanager for APM ")
                 self.http = urllib3.PoolManager(timeout=30.0, cert_reqs='CERT_REQUIRED', ca_certs='/secrets/truststore/ca_public_cert.pem')
             else:
-                logger.debug("PATH 2 inside icp for poolmanager for APM ")
                 if os.path.exists('/var/www/as-pipeline/ca_public_cert.pem'):
-                    logger.debug("PATH 3 inside icp for poolmanager for APM ")
                     self.http = urllib3.PoolManager(timeout=30.0, cert_reqs='CERT_REQUIRED',
                                                     ca_certs='/var/www/as-pipeline/ca_public_cert.pem')
                 else:
-                    logger.debug("PATH 4 inside icp for poolmanager for APM ")
                     if os.path.exists('/project_data/data_asset/ca_public_cert.pem'):
-                        logger.debug("PATH 5 : inside icp for poolmanager for APM ")
-                        logger.debug("Using project ca public cert file from APM")
                         self.http = urllib3.PoolManager(timeout=30.0, cert_reqs='CERT_REQUIRED',
                                                         ca_certs='/project_data/data_asset/ca_public_cert.pem')
         else:
-            logger.debug("PATH 6 inside icp for poolmanager for APM ")
-            self.http = urllib3.PoolManager(timeout=30.0, cert_reqs='CERT_REQUIRED', ca_certs=certifi.where())
+            if 'as' in self.credentials and Database.CERTIFICATE_FILE in self.credentials['as'] and \
+                    self.credentials['as'][Database.CERTIFICATE_FILE] is not None:
+                self.http = urllib3.PoolManager(timeout=30.0, cert_reqs='CERT_REQUIRED',
+                                                ca_certs=self.credentials['as'][Database.CERTIFICATE_FILE])
+            else:
+                self.http = urllib3.PoolManager(timeout=30.0, cert_reqs='CERT_REQUIRED', ca_certs=certifi.where())
 
         try:
             self.cos_client = CosClient(self.credentials)
@@ -501,7 +513,7 @@ class Database(object):
                         logger.warning(msg)
                     for m in metadata:
                         self.entity_type_metadata[m['name']] = m
-                except:
+                except Exception:
                     metadata = None
         else:
             metadata = entity_metadata
@@ -1158,6 +1170,7 @@ class Database(object):
             else:
                 return (None, 'package_error')
         except ImportError:
+            logger.exception('Import Error')
             return (None, 'target_error')
         else:
             return (target, 'ok')
@@ -1410,23 +1423,28 @@ class Database(object):
     def read_sql_query(self, sql, parse_dates=None, index_col=None, requested_col_names=None, log_message=None,
                        **kwargs):
 
-        if log_message is None:
-            logger.info('The following sql statement is executed: %s' % sql)
-        else:
-            logger.info('%s: %s' % (log_message, sql))
-
         # We use a sqlAlchemy connection in read_sql_query(). Therefore returned column names are always in lower case.
         parse_dates = None if parse_dates is None else [col.lower() for col in parse_dates]
+        if isinstance(index_col, str):
+            index_col = [index_col]
         index_col = None if index_col is None else [col.lower() for col in index_col]
 
-        # We do not use parameter 'parse_dates' of pd.read_sql_query() because this function can return columns of type
-        # 'object' even if they are listed in parse_dates. This is the case when the data frame is empty or when there
-        # are None values only in the column. Therefore explicitly cast columns listed in parse_dates to type Timestamp
-        # to avoid type mismatches later on
-        tic = time()
-        df = pd.read_sql_query(sql=sql, con=self.connection, **kwargs)
-        toc = time()
-        logger.info(f"exec_time_secs={toc - tic:.2f}s sql={' '.join(str(sql).split())}")
+        start_time = pd.Timestamp.utcnow()
+        try:
+            # We do not use parameter 'parse_dates' of pd.read_sql_query() because this function can return columns of type
+            # 'object' even if they are listed in parse_dates. This is the case when the data frame is empty or when there
+            # are None values only in the column. Therefore explicitly cast columns listed in parse_dates to type Timestamp
+            # to avoid type mismatches later on
+            df = pd.read_sql_query(sql=sql, con=self.connection, **kwargs)
+
+        except Exception as ex:
+            raise RuntimeError(f"The execution of the following sql statement failed: {sql}") from ex
+        else:
+            execution_time = (pd.Timestamp.utcnow() - start_time).total_seconds()
+            if log_message is None:
+                logger.debug(f"The following sql statement was executed in {execution_time} seconds: {sql}.")
+            else:
+                logger.debug(f"{log_message}: execution time = {execution_time} s, sql = {sql}")
 
         if parse_dates is not None and len(parse_dates) > 0:
             df = df.astype(dtype={col: 'datetime64[ns]' for col in parse_dates}, copy=False, errors='ignore')
