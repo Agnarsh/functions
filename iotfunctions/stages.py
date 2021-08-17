@@ -10,6 +10,7 @@
 
 
 import datetime as dt
+import hashlib
 import json
 import logging
 from collections import defaultdict
@@ -394,8 +395,8 @@ class ProduceAlerts(object):
 
                         logger.info(f"There are no calculated alert events for alert {alert_name}")
 
-                # Push new alert events to database
-                self._push_alert_events_to_db(new_alert_events, index_has_entity_id)
+                # Push new alert events to database and KITT
+                self._push_alert_events_to_db_kitt(new_alert_events, index_has_entity_id)
 
                 # Push new alerts events to message hub if required
                 if len(self.alerts_to_msg_hub) > 0:
@@ -459,7 +460,14 @@ class ProduceAlerts(object):
 
         return result_df.index
 
-    def _push_alert_events_to_db(self, alert_events, index_has_entity_id):
+    def _push_alert_events_to_db_kitt(self, alert_events, index_has_entity_id):
+
+        # Push alert events to DB and KITT in parallel to reduce computational effort
+        kitt_builder = None
+        msg_kitt = ""
+        if self.dms.kitt_client is not None:
+            kitt_builder = self.dms.kitt_client.builder()
+            msg_kitt = "and KITT each "
 
         sql_statement = self._get_sql_statement()
 
@@ -476,27 +484,62 @@ class ProduceAlerts(object):
             domain_status = kpi_input.get('Status')
 
             for index_values in index:
-                # Create for each alert event one entry in list 'rows'
+                # Distinguish with/without entity id
                 if index_has_entity_id is True:
-                    rows.append((self.dms.entity_type_id, alert_name, index_values[0], index_values[1],
-                                 severity, priority, domain_status))
+                    tmp_entity_id = index_values[0]
+                    tmp_timestamp = index_values[1]
                 else:
-                    rows.append((self.dms.entity_type_id, alert_name, None, index_values,
-                                 severity, priority, domain_status))
+                    tmp_entity_id = None
+                    tmp_timestamp = index_values
 
-                # Push alert events in list 'rows' in chunks to alert table in database
+                # Setup alert event for DB
+                rows.append((self.dms.entity_type_id, alert_name, tmp_entity_id, tmp_timestamp, severity, priority,
+                             domain_status))
+
+                if kitt_builder is not None:
+                    # Setup alert event for KITT
+                    timestamp_string = self._get_dt64_as_string(tmp_timestamp)
+                    instance_name = f"{self.dms.entity_type_id}|{alert_name}|{timestamp_string}"
+                    if tmp_entity_id is not None:
+                        instance_name = f"{instance_name}|{tmp_entity_id}"
+                    hashed_instance_name = hashlib.md5(instance_name.encode('utf-8')).hexdigest()
+                    kitt_builder = kitt_builder.instance(hashed_instance_name).name(hashed_instance_name) \
+                        .a("mas:Alert_Event") \
+                        .set_p({"DATAITEM_NAME": alert_name, "EMTITY_TYPE_ID": self.dms.entity_type_id,
+                                "ENTITY_ID": tmp_entity_id, "TIMESTAMP": timestamp_string, "PRIORITY": priority,
+                                "SEVERTITY": severity, "DOMAIN_STATUS": domain_status})
+                        # kohlmann enable       .hasEvent(src=alert_name, tgt=hashed_instance_name)
+
                 if len(rows) == DATALAKE_BATCH_UPDATE_ROWS:
+                    # Push alert events in list 'rows' in chunks to alert table in database
                     total_count += self._push_rows_to_db(sql_statement, rows)
                     rows.clear()
-
                     logger.info(f"{total_count} alert events have been written to alert table so far.")
+
+                    if kitt_builder is not None:
+                        # Push alert events to KITT and create a new builder
+                        kitt_builder.send()
+                        kitt_builder = self.dms.kitt_client.builder()
+                        logger.info(f"{total_count} alert events have been written to KITT so far.")
 
         # Push all remaining rows to database
         if len(rows) > 0:
+            # Push all remaining alert events (= rows) to database
             total_count += self._push_rows_to_db(sql_statement, rows)
 
-        logger.info(f"A total of {total_count} alert events have been written to alert table "
+            if kitt_builder is not None:
+                # Push all remaining alert events to KITT
+                kitt_builder.send()
+
+        logger.info(f"A total of {total_count} alert events have been written to alert table {msg_kitt}"
                     f"in {(dt.datetime.now() - start_time).total_seconds()} seconds.")
+
+    def _get_dt64_as_string(self, timestamp_dt64: np.datetime64):
+        # timestamp_dt64 is supposed to be of type numpy.datetime64. Return a string representation with nanoseconds
+        timestamp = pd.Timestamp(timestamp_dt64)
+        return f"{timestamp.year:04}-{timestamp.month:02}-{timestamp.day:02} " \
+               f"{timestamp.hour:02}:{timestamp.minute:02}:{timestamp.second:02}." \
+               f"{timestamp.microsecond:06}{timestamp.nanosecond:03}"
 
     def _get_sql_statement(self):
 
@@ -591,6 +634,11 @@ class ProduceAlerts(object):
         else:
             raise TypeError(f"Do not know how to convert object of class {obj.__class__.__name__} to JSON")
 
+    def _push_alert_events_to_kitt(df, new_alert_events):
+
+        for alert_name in new_alert_events.columns:
+            index = new_alert_events[alert_name]
+            df_alert_events = df.reindex(index)
 
 class RecordUsage:
 

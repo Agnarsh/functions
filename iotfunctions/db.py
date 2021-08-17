@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 from time import time
+from typing import Optional
 
 import certifi
 import ibm_db
@@ -39,6 +40,8 @@ from . import metadata as md
 from . import pipeline as pp
 from .enginelog import EngineLogging
 from .util import CosClient, resample, reset_df_index
+
+from MAS_Data_Dictionary.MAM_API import MAM_API
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger(__name__)
@@ -545,6 +548,26 @@ class Database(object):
                                                          'postgresql'] and self.entity_type_id is not None and self.schema is not None:
             self.model_store = dbtables.DBModelStore(self.tenant_id, self.entity_type_id, self.schema,
                                                      self.native_connection, self.db_type)
+
+        # Load url and credentials for KITT access
+        kitt_url = os.environ.get("KITT_URL")
+        kitt_user = os.environ.get("KITT_USER")
+        kitt_password = os.environ.get("KITT_PASSWORD")
+        kitt_tenant_id = os.environ.get("KITT_TENANT_ID")
+
+        self.kitt_client = None
+        if kitt_url is not None and kitt_user is not None and kitt_password is not None and kitt_tenant_id is not None:
+            self.kitt_client = MAM_API.tenant_connect(url=kitt_url, usr=kitt_user, pwd=kitt_password, 
+                                                      tenant_id=kitt_tenant_id)
+            if self.kitt_client.connected() is True:
+                logger.info(f"Connection to KITT has been established successfully: url='{kitt_url}', "
+                            f"tenant_id='{tenant_id}'")
+            else:
+                raise ConnectionError(f"Connection to KITT could not be established: url='{kitt_url}', "
+                                      f"tenant_id='{tenant_id}'")
+        else:
+            logger.info(f"No connection to KITT has been defined.")
+
 
     def _aggregate_item(self, table, column_name, aggregate, alias_column=None, dimension_table=None,
                         timestamp_col=None):
